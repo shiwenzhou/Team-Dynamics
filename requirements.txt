@@ -1,0 +1,9 @@
+streamlit>=1.39
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+google-genai>=1.0
+jupyter>=1.0
+nbformat>=5.9
+nbclient>=0.8
+ipython>=8.0

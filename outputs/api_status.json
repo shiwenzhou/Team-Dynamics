@@ -1,0 +1,7 @@
+{
+  "api_key_detected": false,
+  "gemini_response_generated": false,
+  "model": "gemini-2.5-flash",
+  "key_storage_note": "Use Streamlit secrets or environment variables. Do not commit API keys to GitHub.",
+  "synthetic_outputs_ready": true
+}
