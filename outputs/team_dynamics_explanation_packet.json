@@ -1,5 +1,5 @@
 {
-  "run_id": "synthetic_run_001",
+  "run_id": "synthetic_seed42_n900_event450",
   "data_status": "Synthetic demonstration data only; not BioTDMS data and not dissertation results.",
   "rq2_definition_for_course_reader": "RQ2 asks whether a customized AI bot can help non-experts understand and interpret bio-behavioral team dynamics analytics, including how metrics are derived and how they lead to reported results.",
   "prototype_purpose": "Streamlit-based chatbot scaffold for explaining interdependence, adaptation, and influence-distribution outputs from synthetic demonstration data.",

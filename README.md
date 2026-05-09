@@ -1,58 +1,54 @@
 # Bio-Behavioral Team Dynamics Analytics Chatbot Prototype
 
-This repository is a public, synthetic-data Streamlit prototype for a dissertation-support chatbot. The dissertation aim supported here is the customized AI bot portion: helping non-experts understand bio-behavioral team dynamics analytics, including interdependence, adaptation, influence distribution, metric derivations, visual outputs, and limits of interpretation.
+This repository contains a Streamlit prototype for a course final project connected to the dissertation aim of building a customized AI bot that helps stakeholders understand bio-behavioral team dynamics analytics. The public version uses **synthetic data only**. It does not use BioTDMS data, does not test dissertation hypotheses, and does not evaluate real trainees.
 
-The app does **not** use BioTDMS data and does **not** report dissertation findings. All data generated in this repository are synthetic demonstration data.
+## App layout
 
-## What the app does
+The tab order is back to the original order:
 
-The Streamlit app now uses one connected workflow:
+1. **Dashboard**
+2. **Synthetic data**
+3. **Chatbot**
 
-1. **Synthetic data** generates a synthetic 1 Hz time series for a five-role Fire Support Team-style demonstration.
-2. **Dashboard** computes and displays the analysis results from that same synthetic dataset.
-3. **Chatbot** can trigger the local Python analyses and display the current figures and tables in the chat response. When a Gemini key is configured, Gemini explains the already-computed outputs.
+The three tabs are connected through one `st.session_state.analysis_bundle`. The current synthetic dataframe, metric tables, figures, JSON packet, dataset ID, and settings are stored together. When the synthetic data are changed, the Dashboard and Chatbot use the new dataset ID.
 
-The chatbot does not independently calculate metrics. Python computes the metrics; Gemini receives a structured explanation packet and helps translate the outputs into plain language.
+## How the connection works
+
+1. Open the **Synthetic data** tab.
+2. Change the seed, duration, event time, or analysis-window settings.
+3. Click **Generate synthetic data + run analyses**.
+4. Return to **Dashboard** or **Chatbot**. The same dataset ID should appear in all tabs.
+5. Ask the Chatbot to run analyses or show figures/tables. It uses the current synthetic dataframe from the Synthetic data tab.
+
+Example chatbot prompt:
+
+```text
+Run all analyses and show figures and tables using the current synthetic data.
+```
+
+Another example:
+
+```text
+Generate a new synthetic dataset with seed 7, 1200 seconds, event 600, then run all analyses.
+```
 
 ## Analyses included
 
-The prototype computes:
+The local Python pipeline computes the following from the synthetic 1 Hz time series:
 
-- Moving-window Shannon entropy for adaptation / reorganization.
-- Moving-window categorical sample entropy and inverse sample entropy for temporal regularity / interdependence demonstration.
-- Lag-averaged normalized mutual information (AMI) between role symbolic states and the team-state sequence for influence distribution.
-- AMI share and HHI concentration as descriptive summaries of influence distribution.
+- Symbolic team-state trajectory
+- Moving-window Shannon entropy
+- Moving-window sample entropy and inverse sample entropy
+- Moving-window role-level average mutual information (AMI)
+- Role-level AMI summary and influence-concentration HHI
+- Figures and tables displayed directly in the Dashboard and Chatbot
+- A Gemini prompt payload for explanation of the computed outputs
 
-## Repository structure
+Python performs the analyses. Gemini, when configured, explains the already-computed outputs; it does not run the calculations.
 
-```text
-.
-├── streamlit_app.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-├── .streamlit/
-│   ├── config.toml
-│   └── secrets.toml.example
-├── docs/
-│   ├── team_dynamics_chatbot_identity.md
-│   └── team_dynamics_prompt_log.md
-├── notebooks/
-│   └── team_dynamics_chatbot_equations.ipynb
-├── src/
-│   ├── __init__.py
-│   └── team_dynamics_metrics.py
-└── outputs/
-    ├── synthetic_biobehavioral_timeseries.csv
-    ├── synthetic_symbolic_states.csv
-    ├── team_dynamics_explanation_packet.json
-    ├── tables/
-    └── figures/
-```
+## Running locally
 
-## Local setup
-
-Install dependencies:
+Create and activate a virtual environment, then install dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -64,46 +60,41 @@ Run the app:
 streamlit run streamlit_app.py
 ```
 
-The analysis pipeline can also be run from the command line:
+## Gemini key handling
 
-```bash
-python src/team_dynamics_metrics.py --output-dir outputs --identity-path docs/team_dynamics_chatbot_identity.md
-```
+Do not paste an API key into the notebook. The notebook is credential-free.
 
-## Gemini API key setup
-
-The notebook does not contain or request an API key. The Streamlit app reads the key from Streamlit secrets or environment variables.
-
-For local development, copy the example secrets file:
-
-```bash
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-```
-
-Then edit `.streamlit/secrets.toml`:
+For local Streamlit use, create `.streamlit/secrets.toml` and add:
 
 ```toml
 GEMINI_API_KEY = "your_api_key_here"
 ```
 
-Do not commit `.streamlit/secrets.toml`. The `.gitignore` file excludes it.
+For Streamlit Community Cloud, add the same key in the app's secrets settings. The app also checks the environment variables `GEMINI_API_KEY` and `GOOGLE_API_KEY`.
 
-You can also set an environment variable:
+## Repository structure
 
-```bash
-export GEMINI_API_KEY="your_api_key_here"
+```text
+.
+├── streamlit_app.py
+├── requirements.txt
+├── src/
+│   └── team_dynamics_metrics.py
+├── docs/
+│   ├── team_dynamics_chatbot_identity.md
+│   └── team_dynamics_prompt_log.md
+├── notebooks/
+│   └── team_dynamics_chatbot_equations.ipynb
+├── outputs/
+│   ├── synthetic_biobehavioral_timeseries.csv
+│   ├── team_dynamics_explanation_packet.json
+│   ├── figures/
+│   └── tables/
+└── .streamlit/
+    ├── config.toml
+    └── secrets.toml.example
 ```
 
-## Example chatbot questions
+## Interpretation boundaries
 
-Try these in the Chatbot tab:
-
-- `Run all analyses and show figures and tables.`
-- `Explain the entropy peak.`
-- `Show the AMI table.`
-- `What does inverse sample entropy mean here?`
-- `Generate a new synthetic dataset with seed 7, 1200 seconds, event 600.`
-
-## Important interpretation limits
-
-The public version uses synthetic data. The outputs are suitable for testing the analysis and explanation workflow, not for drawing conclusions about real teams or trainees. The chatbot identity file instructs the model not to infer mental states, not to rank individual trainees, not to treat entropy or AMI as direct evidence of good or bad teamwork, and not to fabricate unsupported results.
+The figures and tables are synthetic demonstration artifacts. They are intended to test whether the UI, metric pipeline, prompt structure, and chatbot explanation workflow connect correctly. They should not be interpreted as evidence about real Fire Support Teams, real trainees, or actual performance.

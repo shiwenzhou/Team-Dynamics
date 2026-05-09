@@ -152,6 +152,7 @@ def generate_synthetic_biobehavioral_timeseries(
     rng = np.random.default_rng(seed)
     rows: List[Dict[str, Any]] = []
     previous_team_state = 0
+    run_id = f"synthetic_seed{seed}_n{n_seconds}_event{event_time_sec}"
 
     role_parameters = {
         "fist_leader": {"hr": 82, "resp": 15.5, "alpha": 0.46, "focus": 0.70, "comm": 0.18, "bias": 2},
@@ -260,7 +261,7 @@ def generate_synthetic_biobehavioral_timeseries(
         row: Dict[str, Any] = {
             "time_sec": int(t),
             "time_min": round(t / 60, 4),
-            "run_id": "synthetic_run_001",
+            "run_id": run_id,
             "phase": phase,
             "event_marker": "synthetic_task_change" if t == event_time_sec else "",
             "event_zone": bool(event_zone),
@@ -675,7 +676,7 @@ def build_explanation_packet(
     event_time = _event_time_from_df(timeseries_df)
 
     return {
-        "run_id": "synthetic_run_001",
+        "run_id": str(timeseries_df["run_id"].iloc[0]) if "run_id" in timeseries_df.columns and not timeseries_df.empty else "synthetic_run_001",
         "data_status": "Synthetic demonstration data only; not BioTDMS data and not dissertation results.",
         "rq2_definition_for_course_reader": (
             "RQ2 asks whether a customized AI bot can help non-experts understand and interpret "

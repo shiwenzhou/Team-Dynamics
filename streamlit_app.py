@@ -1,17 +1,22 @@
-"""Connected Streamlit app for the Bio-Behavioral Team Dynamics Analytics Chatbot.
+"""Streamlit app for the Bio-Behavioral Team Dynamics Analytics Chatbot.
 
 Run from the repository root:
     streamlit run streamlit_app.py
 
-What changed in this version:
-    - The synthetic data, dashboard, and chatbot all use the same in-memory session state.
-    - The chatbot can trigger the Python analysis pipeline and display current figures/tables.
-    - Gemini only explains already-computed outputs; Python performs the calculations.
-    - API keys are read from Streamlit secrets or environment variables, never from the notebook.
+This version keeps the original tab order requested by the user:
+    Dashboard -> Synthetic data -> Chatbot
+
+Connection design:
+    1. The Synthetic data tab writes the current dataframe to st.session_state.
+    2. The analysis bundle is recomputed from that same dataframe.
+    3. The Dashboard and Chatbot both read from the same analysis bundle.
+    4. Chat responses store figure bytes and table snapshots so the user sees the
+       outputs produced from the dataset used for that response.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -114,11 +119,26 @@ TABLE_SPECS = {
         "title": "Synthetic 1 Hz time-series preview",
         "key": "timeseries_df",
     },
+    "states": {
+        "title": "Symbolic state table",
+        "key": "states_df",
+    },
+}
+
+CONTROL_KEYS = {
+    "seed_control": "seed",
+    "duration_control": "n_seconds",
+    "event_control": "event_time_sec",
+    "entropy_window_control": "entropy_window",
+    "sampen_window_control": "sampen_window",
+    "ami_window_control": "ami_window",
+    "step_control": "step",
+    "model_control": "model",
 }
 
 
 def get_gemini_key() -> Optional[str]:
-    """Read Gemini key from Streamlit secrets, then from environment variables."""
+    """Read Gemini key from Streamlit secrets, then environment variables."""
 
     secret_key = None
     try:
@@ -129,23 +149,63 @@ def get_gemini_key() -> Optional[str]:
 
 
 def app_settings_from_session() -> Dict[str, int | str]:
-    """Return the current analysis settings from session state."""
+    """Return the active settings that define the current dataset and analyses."""
 
     settings = dict(DEFAULT_SETTINGS)
     settings.update(st.session_state.get("settings", {}))
     return settings
 
 
+def control_settings_from_widgets() -> Dict[str, int | str]:
+    """Read pending settings from Synthetic data tab widgets."""
+
+    settings = dict(DEFAULT_SETTINGS)
+    for widget_key, setting_key in CONTROL_KEYS.items():
+        if widget_key in st.session_state:
+            settings[setting_key] = st.session_state[widget_key]
+        else:
+            settings[setting_key] = st.session_state.get("settings", DEFAULT_SETTINGS).get(setting_key, DEFAULT_SETTINGS[setting_key])
+    return settings
+
+
+def sync_control_widgets(settings: Dict[str, int | str]) -> None:
+    """Synchronize widget defaults after dataset changes from the chatbot."""
+
+    for widget_key, setting_key in CONTROL_KEYS.items():
+        st.session_state[widget_key] = settings[setting_key]
+    st.session_state.controls_need_sync = False
+
+
+def dataset_id_from_dataframe(df: pd.DataFrame, settings: Dict[str, int | str]) -> str:
+    """Create a compact fingerprint for the current synthetic data and settings."""
+
+    hasher = hashlib.sha1()
+    hasher.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
+    hasher.update(pd.util.hash_pandas_object(df, index=True).values.tobytes())
+    return hasher.hexdigest()[:12]
+
+
 def reset_chat_with_note(note: str) -> None:
-    """Reset chat history when the connected dataset changes."""
+    """Reset chat history when the user intentionally switches datasets."""
 
     st.session_state.messages = [
         {
             "role": "assistant",
             "content": note,
-            "artifacts": [],
+            "artifacts": {},
+            "dataset_id": st.session_state.get("dataset_id", "not_initialized"),
         }
     ]
+
+
+
+
+def clear_generation_widget_state() -> None:
+    """Clear Synthetic data widget values so they can be resynced after chatbot-driven generation."""
+
+    for widget_key in list(CONTROL_KEYS):
+        if widget_key in st.session_state:
+            del st.session_state[widget_key]
 
 
 def run_analysis_for_dataframe(
@@ -157,16 +217,32 @@ def run_analysis_for_dataframe(
     step: int,
     model: str,
     user_question: str = DEFAULT_USER_QUESTION,
+    settings_for_id: Optional[Dict[str, int | str]] = None,
 ) -> Dict[str, Any]:
-    """Run all analyses on the current synthetic dataframe and save public outputs.
+    """Run all local Python analyses on the current dataframe.
 
-    The returned bundle is the single source of truth used by the dashboard and
-    chatbot. The app writes CSV/PNG/JSON outputs for GitHub reproducibility, but
-    the UI does not rely on a separate 'Generated files' page.
+    The returned bundle is the single source of truth used by Dashboard and
+    Chatbot. Files are also written for GitHub reproducibility, but the live UI
+    reads the in-memory bundle and figure bytes rather than relying on a static
+    files tab.
     """
 
     paths = build_output_paths(OUTPUT_DIR)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    active_settings = dict(app_settings_from_session())
+    if settings_for_id:
+        active_settings.update(settings_for_id)
+    active_settings.update(
+        {
+            "entropy_window": int(entropy_window),
+            "sampen_window": int(sampen_window),
+            "ami_window": int(ami_window),
+            "step": int(step),
+            "model": str(model),
+        }
+    )
+    current_dataset_id = dataset_id_from_dataframe(df, active_settings)
 
     states_df = extract_symbolic_state_table(df)
     entropy_df = moving_window_entropy(df, window=int(entropy_window), step=int(step))
@@ -196,8 +272,16 @@ def run_analysis_for_dataframe(
         paths,
         user_question=user_question,
     )
+    packet["streamlit_connection_status"] = {
+        "dataset_id": current_dataset_id,
+        "uses_current_synthetic_data_from_session_state": True,
+        "local_python_runs_metrics_before_llm_explanation": True,
+        "dashboard_and_chatbot_share_same_analysis_bundle": True,
+        "settings": active_settings,
+    }
     paths.packet_json.write_text(json.dumps(packet, indent=2), encoding="utf-8")
     write_api_status(paths, api_key_detected=bool(get_gemini_key()), response_generated=False, model=str(model))
+
     required_files = [
         paths.synthetic_csv,
         paths.state_csv,
@@ -224,19 +308,18 @@ def run_analysis_for_dataframe(
         "ami_long_df": ami_long_df,
         "ami_summary_df": ami_summary_df,
         "packet": packet,
+        "dataset_id": current_dataset_id,
         "last_analysis_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "settings": {
-            "entropy_window": int(entropy_window),
-            "sampen_window": int(sampen_window),
-            "ami_window": int(ami_window),
-            "step": int(step),
-            "model": str(model),
-        },
+        "settings": active_settings,
     }
 
 
-def generate_data_and_run_analysis(settings: Dict[str, int | str], *, user_question: str = DEFAULT_USER_QUESTION) -> None:
-    """Generate the connected synthetic dataset and immediately run analyses."""
+def generate_data_and_run_analysis(
+    settings: Dict[str, int | str],
+    *,
+    user_question: str = DEFAULT_USER_QUESTION,
+) -> None:
+    """Generate a connected synthetic dataset and immediately run analyses."""
 
     df = generate_synthetic_biobehavioral_timeseries(
         n_seconds=int(settings["n_seconds"]),
@@ -251,10 +334,42 @@ def generate_data_and_run_analysis(settings: Dict[str, int | str], *, user_quest
         step=int(settings["step"]),
         model=str(settings["model"]),
         user_question=user_question,
+        settings_for_id=settings,
     )
+    previous_dataset_id = st.session_state.get("dataset_id")
     st.session_state.timeseries_df = df
     st.session_state.analysis_bundle = bundle
     st.session_state.settings = dict(settings)
+    st.session_state.dataset_id = bundle["dataset_id"]
+    if previous_dataset_id and previous_dataset_id != bundle["dataset_id"]:
+        st.session_state.dataset_version = int(st.session_state.get("dataset_version", 1)) + 1
+    else:
+        st.session_state.dataset_version = int(st.session_state.get("dataset_version", 1))
+
+
+def rerun_analysis_on_current_dataframe(
+    settings: Dict[str, int | str],
+    *,
+    user_question: str = DEFAULT_USER_QUESTION,
+) -> None:
+    """Keep the current synthetic data but recompute analyses with current windows."""
+
+    if "timeseries_df" not in st.session_state:
+        generate_data_and_run_analysis(settings, user_question=user_question)
+        return
+    bundle = run_analysis_for_dataframe(
+        st.session_state.timeseries_df,
+        entropy_window=int(settings["entropy_window"]),
+        sampen_window=int(settings["sampen_window"]),
+        ami_window=int(settings["ami_window"]),
+        step=int(settings["step"]),
+        model=str(settings["model"]),
+        user_question=user_question,
+        settings_for_id=settings,
+    )
+    st.session_state.analysis_bundle = bundle
+    st.session_state.settings = dict(settings)
+    st.session_state.dataset_id = bundle["dataset_id"]
 
 
 def ensure_connected_state() -> None:
@@ -262,12 +377,15 @@ def ensure_connected_state() -> None:
 
     if "settings" not in st.session_state:
         st.session_state.settings = dict(DEFAULT_SETTINGS)
+    if "dataset_version" not in st.session_state:
+        st.session_state.dataset_version = 1
     if "timeseries_df" not in st.session_state or "analysis_bundle" not in st.session_state:
         generate_data_and_run_analysis(app_settings_from_session())
+        st.session_state.controls_need_sync = True
     if "messages" not in st.session_state:
         reset_chat_with_note(
-            "I am connected to the current synthetic dataset. You can ask me to run the analyses, "
-            "show entropy, show inverse sample entropy, show AMI, display tables, or explain a figure."
+            "I am connected to the current synthetic dataset. Change the dataset in the Synthetic data tab, "
+            "then ask me to run analyses, show figures or tables, or explain the outputs."
         )
 
 
@@ -278,11 +396,14 @@ def parse_generation_overrides(question: str, settings: Dict[str, int | str]) ->
     lower = question.lower()
     seed_match = re.search(r"seed\s*(?:=|is|:)?\s*(\d+)", lower)
     seconds_match = re.search(r"(\d{3,4})\s*(?:seconds|sec|s)\b", lower)
+    duration_match = re.search(r"duration\s*(?:=|is|:)?\s*(\d{3,4})", lower)
     event_match = re.search(r"event\s*(?:time|at|=|is|:)?\s*(\d{2,4})", lower)
 
     if seed_match:
         updated["seed"] = int(seed_match.group(1))
-    if seconds_match:
+    if duration_match:
+        updated["n_seconds"] = max(300, min(1800, int(duration_match.group(1))))
+    elif seconds_match:
         updated["n_seconds"] = max(300, min(1800, int(seconds_match.group(1))))
     if event_match:
         event_time = int(event_match.group(1))
@@ -292,10 +413,29 @@ def parse_generation_overrides(question: str, settings: Dict[str, int | str]) ->
 
 
 def classify_user_request(question: str) -> Dict[str, Any]:
-    """Classify the user's request into local analysis actions and UI artifacts."""
+    """Classify the user request into local analysis actions and UI artifacts."""
 
     q = question.lower()
-    wants_generate = any(term in q for term in ["generate", "create", "new synthetic", "regenerate", "simulate"])
+    wants_generate = any(
+        term in q
+        for term in [
+            "generate",
+            "create",
+            "new synthetic",
+            "new data",
+            "new dataset",
+            "regenerate",
+            "simulate",
+            "different data",
+            "different dataset",
+            "change data",
+            "change the data",
+            "use seed",
+            "set seed",
+            "change seed",
+            "with seed",
+        ]
+    )
     wants_run = any(term in q for term in ["run", "compute", "calculate", "analyze", "analyse", "analysis", "analyses"])
     wants_figures = any(term in q for term in ["figure", "figures", "plot", "plots", "graph", "visual", "visualization"])
     wants_tables = any(term in q for term in ["table", "tables", "dataframe", "data frame", "csv", "values", "output"])
@@ -314,7 +454,7 @@ def classify_user_request(question: str) -> Dict[str, Any]:
         table_keys.extend(["ami_summary", "ami_long"])
     if any(term in q for term in ["team state", "symbolic state", "state trajectory", "timeline"]):
         figure_keys.append("team_state")
-        table_keys.append("synthetic_data")
+        table_keys.append("states")
 
     asks_for_everything = wants_run and (
         "all" in q or "everything" in q or "figures and tables" in q or "outputs" in q or "data analyses" in q
@@ -322,9 +462,8 @@ def classify_user_request(question: str) -> Dict[str, Any]:
     if asks_for_everything or (wants_figures and not figure_keys):
         figure_keys.extend(["team_state", "entropy", "inverse_sampen", "ami_summary", "ami_heatmap"])
     if asks_for_everything or (wants_tables and not table_keys):
-        table_keys.extend(["entropy", "inverse_sampen", "ami_summary"])
+        table_keys.extend(["entropy", "inverse_sampen", "ami_summary", "ami_long"])
 
-    # Remove duplicates while preserving order.
     figure_keys = list(dict.fromkeys(figure_keys))
     table_keys = list(dict.fromkeys(table_keys))
 
@@ -346,11 +485,13 @@ def local_analysis_summary(bundle: Dict[str, Any]) -> str:
     entropy = packet["adaptation_entropy_summary"]
     inverse = packet["interdependence_inverse_sample_entropy_summary"]
     influence = packet["influence_distribution_summary"]
+    settings = bundle.get("settings", app_settings_from_session())
+    dataset_id = bundle.get("dataset_id", st.session_state.get("dataset_id", "unknown"))
     n_rows = len(bundle["timeseries_df"])
-    settings = app_settings_from_session()
     return (
-        f"I ran the local Python analyses on the current synthetic 1 Hz dataset ({n_rows:,} rows; "
-        f"seed={settings['seed']}; synthetic event={settings['event_time_sec']} sec).\n\n"
+        f"I ran the local Python analyses on the current synthetic 1 Hz dataset "
+        f"(dataset ID `{dataset_id}`, {n_rows:,} rows, seed={settings['seed']}, "
+        f"synthetic event={settings['event_time_sec']} sec).\n\n"
         f"**Computed outputs:** Shannon entropy mean = {entropy['mean_entropy_bits']}, "
         f"peak = {entropy['peak_entropy_bits']} bits at {entropy['peak_time_min']} min; "
         f"inverse sample entropy mean = {inverse['mean_inverse_sample_entropy']}, "
@@ -368,7 +509,7 @@ def build_chat_prompt_with_current_outputs(
     requested_figures: List[str],
     requested_tables: List[str],
 ) -> str:
-    """Build a Gemini prompt that clearly separates local computation from LLM explanation."""
+    """Build a Gemini prompt that separates local computation from LLM explanation."""
 
     identity_text = load_identity_text(IDENTITY_PATH)
     packet = dict(bundle["packet"])
@@ -384,9 +525,60 @@ def build_chat_prompt_with_current_outputs(
     extra = """
 
 Additional instruction for this Streamlit version:
-The user is interacting with a connected app. Python has already generated the synthetic data and computed the metric tables and figures. You should explain the current outputs and, when relevant, refer to the figures/tables that the app displays below your answer. Do not claim that Gemini ran Python code, do not invent values not in the JSON packet, and do not evaluate individual trainees.
+The user is interacting with a connected app. Python has already generated the current synthetic data and computed the metric tables and figures. You should explain the current outputs and, when relevant, refer to the figures/tables that the app displays below your answer. Do not claim that Gemini ran Python code, do not invent values not in the JSON packet, and do not evaluate individual trainees.
 """
     return base_prompt + extra
+
+
+def figure_payloads_for_message(figure_keys: List[str], bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Store figure bytes in the chat message to avoid stale cached files."""
+
+    payloads: List[Dict[str, Any]] = []
+    paths = bundle["paths"]
+    for key in figure_keys:
+        spec = FIGURE_SPECS[key]
+        path = getattr(paths, spec["path_attr"])
+        if path.exists():
+            payloads.append(
+                {
+                    "key": key,
+                    "title": spec["title"],
+                    "caption": f"{spec['caption']} Dataset ID: {bundle['dataset_id']}.",
+                    "image_bytes": path.read_bytes(),
+                }
+            )
+    return payloads
+
+
+def table_payloads_for_message(table_keys: List[str], bundle: Dict[str, Any], *, max_rows: int = 80) -> List[Dict[str, Any]]:
+    """Store table snapshots in the chat message."""
+
+    payloads: List[Dict[str, Any]] = []
+    for key in table_keys:
+        spec = TABLE_SPECS[key]
+        table_df = bundle[spec["key"]].head(max_rows).copy()
+        payloads.append(
+            {
+                "key": key,
+                "title": f"{spec['title']} (dataset ID {bundle['dataset_id']})",
+                "df": table_df,
+            }
+        )
+    return payloads
+
+
+def artifact_payload_for_message(
+    figure_keys: List[str],
+    table_keys: List[str],
+    bundle: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Create immutable chat artifacts from the current analysis bundle."""
+
+    return {
+        "dataset_id": bundle["dataset_id"],
+        "figures": figure_payloads_for_message(figure_keys, bundle),
+        "tables": table_payloads_for_message(table_keys, bundle),
+    }
 
 
 def render_metric_cards(bundle: Dict[str, Any]) -> None:
@@ -396,28 +588,29 @@ def render_metric_cards(bundle: Dict[str, Any]) -> None:
     entropy = packet["adaptation_entropy_summary"]
     inverse = packet["interdependence_inverse_sample_entropy_summary"]
     influence = packet["influence_distribution_summary"]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(bundle['timeseries_df']):,}")
-    c2.metric("Peak entropy", f"{entropy['peak_entropy_bits']:.3f} bits", f"{entropy['peak_time_min']:.2f} min")
-    c3.metric("Peak inverse SampEn", f"{inverse['peak_inverse_sample_entropy']:.3f}", f"{inverse['peak_time_min']:.2f} min")
-    c4.metric("Top mean AMI share", influence["top_role_by_mean_ami_share"], f"{influence['top_role_mean_ami_share']:.3f}")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Dataset ID", bundle["dataset_id"])
+    c2.metric("Rows", f"{len(bundle['timeseries_df']):,}")
+    c3.metric("Peak entropy", f"{entropy['peak_entropy_bits']:.3f} bits", f"{entropy['peak_time_min']:.2f} min")
+    c4.metric("Peak inverse SampEn", f"{inverse['peak_inverse_sample_entropy']:.3f}", f"{inverse['peak_time_min']:.2f} min")
+    c5.metric("Top mean AMI share", influence["top_role_by_mean_ami_share"], f"{influence['top_role_mean_ami_share']:.3f}")
 
 
-def render_figures(figure_keys: List[str], bundle: Dict[str, Any]) -> None:
-    """Render figure artifacts for a chat response or dashboard section."""
+def render_figures_from_bundle(figure_keys: List[str], bundle: Dict[str, Any]) -> None:
+    """Render current dashboard figures from bytes rather than static browser-cached paths."""
 
     paths = bundle["paths"]
     for key in figure_keys:
         spec = FIGURE_SPECS[key]
         path = getattr(paths, spec["path_attr"])
         if path.exists():
-            st.image(str(path), caption=spec["caption"], use_container_width=True)
+            st.image(path.read_bytes(), caption=f"{spec['caption']} Dataset ID: {bundle['dataset_id']}.", use_container_width=True)
         else:
             st.warning(f"Missing figure: {path.name}")
 
 
-def render_tables(table_keys: List[str], bundle: Dict[str, Any], *, max_rows: int = 80) -> None:
-    """Render table artifacts for a chat response or dashboard section."""
+def render_tables_from_bundle(table_keys: List[str], bundle: Dict[str, Any], *, max_rows: int = 80) -> None:
+    """Render current dashboard tables."""
 
     for key in table_keys:
         spec = TABLE_SPECS[key]
@@ -426,18 +619,28 @@ def render_tables(table_keys: List[str], bundle: Dict[str, Any], *, max_rows: in
         st.dataframe(df.head(max_rows), use_container_width=True)
 
 
-def render_message(message: Dict[str, Any], bundle: Dict[str, Any]) -> None:
-    """Render a stored chat message with optional tables and figures."""
+def render_message(message: Dict[str, Any]) -> None:
+    """Render a stored chat message with its own figure/table snapshots."""
 
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         artifacts = message.get("artifacts", {}) or {}
-        figure_keys = artifacts.get("figures", [])
-        table_keys = artifacts.get("tables", [])
-        if figure_keys:
-            render_figures(figure_keys, bundle)
-        if table_keys:
-            render_tables(table_keys, bundle)
+        for fig in artifacts.get("figures", []):
+            st.image(fig["image_bytes"], caption=fig["caption"], use_container_width=True)
+        for table in artifacts.get("tables", []):
+            st.markdown(f"**{table['title']}**")
+            st.dataframe(table["df"], use_container_width=True)
+
+
+def current_dataset_status(bundle: Dict[str, Any]) -> str:
+    """Return a compact status line for the active connected dataset."""
+
+    settings = bundle.get("settings", app_settings_from_session())
+    return (
+        f"Connected dataset ID `{bundle['dataset_id']}` | version {st.session_state.get('dataset_version', 1)} | "
+        f"{len(bundle['timeseries_df']):,} rows at 1 Hz | seed={settings['seed']} | "
+        f"event={settings['event_time_sec']} sec | last analysis={bundle['last_analysis_time']}"
+    )
 
 
 st.set_page_config(
@@ -447,51 +650,21 @@ st.set_page_config(
 )
 
 ensure_connected_state()
+if st.session_state.get("controls_need_sync", False):
+    sync_control_widgets(app_settings_from_session())
+
 bundle = st.session_state.analysis_bundle
 settings = app_settings_from_session()
 
 st.title("Bio-Behavioral Team Dynamics Analytics Chatbot Prototype")
 st.caption(
-    "Synthetic demonstration data only. The Streamlit app connects synthetic data generation, metric analyses, "
-    "dashboard outputs, and chatbot interpretation in one workflow."
+    "Synthetic demonstration data only. The Dashboard, Synthetic data tab, and Chatbot now share the same "
+    "session-state dataset and analysis bundle."
 )
 
 with st.sidebar:
-    st.header("Current synthetic dataset")
-    st.caption("Changing these settings and clicking the button regenerates the dataset and reruns all analyses.")
-    settings["seed"] = st.number_input("Random seed", min_value=1, max_value=9999, value=int(settings["seed"]), step=1)
-    settings["n_seconds"] = st.slider(
-        "Duration (seconds, 1 Hz)", min_value=300, max_value=1800, value=int(settings["n_seconds"]), step=60
-    )
-    settings["event_time_sec"] = st.slider(
-        "Synthetic event time (seconds)",
-        min_value=30,
-        max_value=int(settings["n_seconds"]) - 30,
-        value=min(int(settings["event_time_sec"]), int(settings["n_seconds"]) - 30),
-        step=15,
-    )
-    st.divider()
-    st.header("Analysis settings")
-    settings["entropy_window"] = st.slider(
-        "Entropy window (seconds)", min_value=60, max_value=300, value=int(settings["entropy_window"]), step=15
-    )
-    settings["sampen_window"] = st.slider(
-        "Sample entropy window (seconds)", min_value=90, max_value=360, value=int(settings["sampen_window"]), step=15
-    )
-    settings["ami_window"] = st.slider(
-        "AMI window (seconds)", min_value=90, max_value=360, value=int(settings["ami_window"]), step=15
-    )
-    settings["step"] = st.slider("Window step (seconds)", min_value=5, max_value=60, value=int(settings["step"]), step=5)
-    settings["model"] = st.text_input("Gemini model", value=str(settings["model"]))
-
-    if st.button("Generate synthetic data + run analyses", type="primary", use_container_width=True):
-        with st.spinner("Generating synthetic time series and computing all metric outputs..."):
-            generate_data_and_run_analysis(settings)
-        reset_chat_with_note(
-            "I regenerated the synthetic dataset and reran the analyses. Ask me to show figures/tables or explain the outputs."
-        )
-        st.rerun()
-
+    st.header("Connection status")
+    st.write(current_dataset_status(bundle))
     st.divider()
     st.header("Gemini API")
     api_key = get_gemini_key()
@@ -500,101 +673,173 @@ with st.sidebar:
     else:
         st.warning("No Gemini key detected.")
         st.caption("Use `.streamlit/secrets.toml` locally or Streamlit Cloud secrets. Do not paste keys into the notebook.")
-
-bundle = st.session_state.analysis_bundle
-settings = app_settings_from_session()
-
-st.info(
-    f"Connected dataset: {len(bundle['timeseries_df']):,} synthetic 1 Hz rows; seed={settings['seed']}; "
-    f"synthetic event={settings['event_time_sec']} sec; last analysis={bundle['last_analysis_time']}."
-)
-
-tab_data, tab_dashboard, tab_chat, tab_equations = st.tabs(
-    ["Synthetic data", "Dashboard", "Chatbot", "Equations & export"]
-)
-
-with tab_data:
-    st.subheader("Synthetic 1 Hz time series")
-    st.write(
-        "This tab creates the same dataframe used by the dashboard and chatbot. The synthetic data contain "
-        "placeholder role-level bio-behavioral features, symbolic role states, a symbolic team state, phase labels, "
-        "and a synthetic event marker."
+    st.divider()
+    st.header("Suggested chatbot prompts")
+    st.markdown(
+        "- Run all analyses and show figures and tables.\n"
+        "- Explain the entropy peak using the current dataset.\n"
+        "- Show the AMI table for the current synthetic data.\n"
+        "- Generate a new synthetic dataset with seed 7, 1200 seconds, event 600, then run all analyses."
     )
-    render_metric_cards(bundle)
-    st.markdown("**Current synthetic time-series preview**")
-    st.dataframe(bundle["timeseries_df"].head(100), use_container_width=True)
-    with st.expander("Symbolic state table used for entropy, sample entropy, and AMI"):
-        st.dataframe(bundle["states_df"].head(100), use_container_width=True)
-    st.download_button(
-        "Download current synthetic time series CSV",
-        data=bundle["timeseries_df"].to_csv(index=False).encode("utf-8"),
-        file_name="synthetic_biobehavioral_timeseries.csv",
-        mime="text/csv",
-    )
+
+st.info(current_dataset_status(bundle))
+
+tab_dashboard, tab_data, tab_chat = st.tabs(["Dashboard", "Synthetic data", "Chatbot"])
 
 with tab_dashboard:
-    st.subheader("Analysis dashboard for the current synthetic dataset")
+    st.subheader("Dashboard for the current synthetic dataset")
     st.write(
-        "The figures and tables below are computed from the synthetic data currently shown in the Synthetic data tab. "
-        "The chatbot uses these same outputs when answering questions."
+        "This dashboard reads the same analysis bundle that the chatbot uses. To change the dataset, go to the "
+        "Synthetic data tab, generate a new dataset, and return here. The dataset ID will change when the data change."
     )
     render_metric_cards(bundle)
     c1, c2 = st.columns(2)
     with c1:
-        render_figures(["team_state", "entropy", "ami_summary"], bundle)
+        render_figures_from_bundle(["team_state", "entropy", "ami_summary"], bundle)
     with c2:
-        render_figures(["inverse_sampen", "ami_heatmap"], bundle)
+        render_figures_from_bundle(["inverse_sampen", "ami_heatmap"], bundle)
 
     st.subheader("Metric tables")
     table_choice = st.selectbox(
         "Choose a table",
-        options=["entropy", "inverse_sampen", "ami_summary", "ami_long"],
+        options=["entropy", "inverse_sampen", "ami_summary", "ami_long", "synthetic_data", "states"],
         format_func=lambda key: TABLE_SPECS[key]["title"],
+        key="dashboard_table_choice",
     )
-    render_tables([table_choice], bundle, max_rows=150)
+    render_tables_from_bundle([table_choice], bundle, max_rows=150)
+
+with tab_data:
+    st.subheader("Synthetic data generator")
+    st.write(
+        "Use this tab to create the dataset used by both the dashboard and chatbot. The app generates a synthetic "
+        "1 Hz time series with placeholder role-level bio-behavioral features, symbolic role states, phase labels, "
+        "a symbolic team state, and one synthetic event marker."
+    )
+
+    st.markdown("#### Dataset settings")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.number_input("Random seed", min_value=1, max_value=9999, value=int(settings["seed"]), step=1, key="seed_control")
+    with c2:
+        st.slider(
+            "Duration (seconds, 1 Hz)",
+            min_value=300,
+            max_value=1800,
+            value=int(settings["n_seconds"]),
+            step=60,
+            key="duration_control",
+        )
+    with c3:
+        max_event = max(60, int(st.session_state.get("duration_control", settings["n_seconds"])) - 30)
+        current_event_value = min(int(settings["event_time_sec"]), max_event)
+        st.slider(
+            "Synthetic event time (seconds)",
+            min_value=30,
+            max_value=max_event,
+            value=current_event_value,
+            step=15,
+            key="event_control",
+        )
+
+    st.markdown("#### Analysis settings")
+    c4, c5, c6, c7 = st.columns(4)
+    with c4:
+        st.slider("Entropy window (seconds)", min_value=60, max_value=300, value=int(settings["entropy_window"]), step=15, key="entropy_window_control")
+    with c5:
+        st.slider("Sample entropy window (seconds)", min_value=90, max_value=360, value=int(settings["sampen_window"]), step=15, key="sampen_window_control")
+    with c6:
+        st.slider("AMI window (seconds)", min_value=90, max_value=360, value=int(settings["ami_window"]), step=15, key="ami_window_control")
+    with c7:
+        st.slider("Window step (seconds)", min_value=5, max_value=60, value=int(settings["step"]), step=5, key="step_control")
+    st.text_input("Gemini model", value=str(settings["model"]), key="model_control")
+
+    pending_settings = control_settings_from_widgets()
+    settings_changed = pending_settings != settings
+    if settings_changed:
+        st.warning("You have pending settings changes. Click one of the buttons below to apply them to the dashboard and chatbot.")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Generate synthetic data + run analyses", type="primary", use_container_width=True):
+            with st.spinner("Generating a new synthetic time series and recomputing all outputs..."):
+                generate_data_and_run_analysis(pending_settings)
+            reset_chat_with_note(
+                "The synthetic dataset was regenerated, and I am now connected to the new data. "
+                "Ask me to run analyses, show figures or tables, or explain the outputs."
+            )
+            st.success("Synthetic data, dashboard, and chatbot were updated together.")
+            st.rerun()
+    with b2:
+        if st.button("Keep current data + rerun analyses", use_container_width=True):
+            with st.spinner("Recomputing analyses on the current synthetic time series..."):
+                rerun_analysis_on_current_dataframe(pending_settings)
+            reset_chat_with_note(
+                "The existing synthetic dataset was kept, and the analyses were recomputed with the current window settings."
+            )
+            st.success("Dashboard and chatbot analyses were updated together.")
+            st.rerun()
+
+    st.markdown("#### Current connected synthetic data")
+    render_metric_cards(bundle)
+    st.dataframe(bundle["timeseries_df"].head(100), use_container_width=True)
+    with st.expander("Symbolic state table used for entropy, sample entropy, and AMI"):
+        st.dataframe(bundle["states_df"].head(100), use_container_width=True)
+    with st.expander("Download current connected outputs"):
+        st.download_button(
+            "Download current synthetic time series CSV",
+            data=bundle["timeseries_df"].to_csv(index=False).encode("utf-8"),
+            file_name=f"synthetic_biobehavioral_timeseries_{bundle['dataset_id']}.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download current explanation packet JSON",
+            data=json.dumps(bundle["packet"], indent=2).encode("utf-8"),
+            file_name=f"team_dynamics_explanation_packet_{bundle['dataset_id']}.json",
+            mime="application/json",
+        )
 
 with tab_chat:
     st.subheader("Chatbot connected to the current synthetic data and analyses")
     st.write(
-        "Ask the chatbot to run analyses, show figures, display tables, or explain a metric. Python computes the "
-        "outputs locally; Gemini, when configured, explains the already-computed results."
+        "The chatbot uses the current dataset ID shown below. When you ask it to run analyses, Python recomputes "
+        "the metrics from the active synthetic dataframe. If Gemini is configured, Gemini explains those already-computed outputs."
     )
-    st.markdown(
-        "Try: `Run all analyses and show figures and tables`, `Explain the entropy peak`, "
-        "`Show the AMI table`, or `Generate a new synthetic dataset with seed 7, 1200 seconds, event 600`."
-    )
+    st.success(current_dataset_status(bundle))
 
     for message in st.session_state.messages:
-        render_message(message, bundle)
+        render_message(message)
 
-    user_question = st.chat_input("Ask the connected chatbot about the current synthetic data or analyses")
+    user_question = st.chat_input("Ask about the current synthetic data, run analyses, or request figures/tables")
     if user_question:
-        st.session_state.messages.append({"role": "user", "content": user_question, "artifacts": {}})
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": user_question,
+                "artifacts": {},
+                "dataset_id": st.session_state.get("dataset_id"),
+            }
+        )
         request = classify_user_request(user_question)
+        settings = app_settings_from_session()
 
         with st.spinner("Processing request with the connected Python analysis pipeline..."):
             if request["generate"]:
                 updated_settings = parse_generation_overrides(user_question, settings)
                 generate_data_and_run_analysis(updated_settings, user_question=user_question)
+                st.session_state.controls_need_sync = True
                 bundle = st.session_state.analysis_bundle
                 settings = app_settings_from_session()
+                clear_generation_widget_state()
             elif request["run_analysis"]:
-                # Rerun analyses on the current connected synthetic dataframe.
-                st.session_state.analysis_bundle = run_analysis_for_dataframe(
-                    st.session_state.timeseries_df,
-                    entropy_window=int(settings["entropy_window"]),
-                    sampen_window=int(settings["sampen_window"]),
-                    ami_window=int(settings["ami_window"]),
-                    step=int(settings["step"]),
-                    model=str(settings["model"]),
-                    user_question=user_question,
-                )
+                rerun_analysis_on_current_dataframe(settings, user_question=user_question)
+                bundle = st.session_state.analysis_bundle
+            else:
                 bundle = st.session_state.analysis_bundle
 
         figure_keys = request["figure_keys"]
         table_keys = request["table_keys"]
         if request["run_analysis"] and not figure_keys and not table_keys:
-            figure_keys = ["entropy", "inverse_sampen", "ami_summary"]
+            figure_keys = ["team_state", "entropy", "inverse_sampen", "ami_summary", "ami_heatmap"]
             table_keys = ["entropy", "inverse_sampen", "ami_summary"]
 
         prompt = build_chat_prompt_with_current_outputs(user_question, bundle, figure_keys, table_keys)
@@ -612,67 +857,18 @@ with tab_chat:
         else:
             response = local_summary
             if not get_gemini_key():
-                response += "\n\nGemini is not configured, so this response is the local Python-computed summary only."
+                response += "\n\nGemini is not configured, so this response is the local Python-computed summary plus displayed artifacts."
             elif not request["wants_gemini_explanation"]:
                 response += "\n\nI displayed the requested computed artifacts without asking Gemini for a narrative explanation."
 
+        artifacts = artifact_payload_for_message(figure_keys, table_keys, bundle)
         st.session_state.messages.append(
             {
                 "role": "assistant",
                 "content": response,
-                "artifacts": {"figures": figure_keys, "tables": table_keys},
+                "artifacts": artifacts,
+                "dataset_id": bundle["dataset_id"],
             }
         )
         st.rerun()
 
-with tab_equations:
-    st.subheader("Notebook equations and lightweight exports")
-    st.write(
-        "The Jupyter notebook remains credential-free and contains the equations for symbolic-state construction, "
-        "Shannon entropy, sample entropy, inverse sample entropy, mutual information, AMI share, and HHI."
-    )
-    st.markdown(
-        r"""
-**Shannon entropy**
-
-$$H_w = - \sum_{s \in \mathcal{S}} p_w(s) \log_2 p_w(s)$$
-
-**Sample entropy**
-
-$$\mathrm{SampEn}(m,N) = -\ln\left(\frac{A}{B}\right)$$
-
-**Inverse sample entropy index**
-
-$$\mathrm{InvSampEn} = \frac{1}{1 + \mathrm{SampEn}}$$
-
-**Mutual information**
-
-$$I(X;Y)=\sum_x\sum_y p(x,y)\log_2\frac{p(x,y)}{p(x)p(y)}$$
-
-**Relative AMI share**
-
-$$\mathrm{Share}_{r,w}=\frac{AMI_{r,w}}{\sum_j AMI_{j,w}}$$
-        """
-    )
-    with st.expander("Download current outputs"):
-        downloads = {
-            "Synthetic time series CSV": bundle["timeseries_df"].to_csv(index=False),
-            "Entropy table CSV": bundle["entropy_df"].to_csv(index=False),
-            "Inverse sample entropy table CSV": bundle["inverse_df"].to_csv(index=False),
-            "AMI summary table CSV": bundle["ami_summary_df"].to_csv(index=False),
-            "Explanation packet JSON": json.dumps(bundle["packet"], indent=2),
-        }
-        for label, content in downloads.items():
-            suffix = "json" if label.endswith("JSON") else "csv"
-            st.download_button(
-                label,
-                data=content.encode("utf-8"),
-                file_name=label.lower().replace(" ", "_").replace("/", "_") + f".{suffix}",
-                mime="application/json" if suffix == "json" else "text/csv",
-            )
-    with st.expander("Current Gemini prompt payload"):
-        prompt_path = bundle["paths"].prompt_md
-        if prompt_path.exists():
-            st.code(prompt_path.read_text(encoding="utf-8")[:12000], language="markdown")
-        else:
-            st.info("Ask the chatbot a question to create the current Gemini prompt payload.")
